@@ -244,7 +244,19 @@ impl<T> UpdatingRef<T> {
     }
 
     #[inline]
-    fn update_ptr(&mut self) {
+    pub fn update(&mut self) -> bool {
+        let old_ptr = self.ptr.load(Relaxed);
+        let ptr = unsafe { (*old_ptr).forward.load(Relaxed) };
+        if ptr.is_null() {
+            false;
+        }
+
+        self.follow_ptr(old_ptr, ptr);
+    }
+
+
+    #[inline]
+    pub fn update_latest(&mut self) {
         let old_ptr = self.ptr.load(Relaxed);
         let ptr = unsafe { (*old_ptr).forward.load(Relaxed) };
         if ptr.is_null() {
@@ -255,7 +267,7 @@ impl<T> UpdatingRef<T> {
 
     // next must not be null
     #[inline(never)]
-    fn follow_ptr(&self, mut orig: *mut RefInner<T>, mut next: *mut RefInner<T>){
+    fn follow_ptr(&mut self, mut orig: *mut RefInner<T>, mut next: *mut RefInner<T>){
         loop {
             loop {
                 let n_ptr = unsafe { (*next).forward.load(Relaxed) };
