@@ -1,7 +1,6 @@
 pub mod arcu;
 pub use arcu::*;
 
-
 #[cfg(test)]
 mod tests {
     use super::*;

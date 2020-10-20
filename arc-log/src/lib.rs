@@ -1,13 +1,19 @@
-#![feature(allocator_api, slice_ptr_get, try_reserve, optin_builtin_traits, negative_impls)]
+#![feature(
+    allocator_api,
+    slice_ptr_get,
+    try_reserve,
+    optin_builtin_traits,
+    negative_impls
+)]
 
 pub mod arc_log;
 pub use arc_log::*;
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    //    use tracing_subscriber;
+    use tracing::Level;
+    use tracing_subscriber;
 
     #[derive(Debug)]
     struct DropTest(usize);
@@ -22,7 +28,9 @@ mod tests {
 
     #[test]
     fn it_works() {
-        //tracing_subscriber::fmt().with_max_level(Level::TRACE).init();
+        tracing_subscriber::fmt()
+            .with_max_level(Level::TRACE)
+            .init();
         let mut v = ArcLog::new();
 
         v.push(DropTest(1));
@@ -33,7 +41,9 @@ mod tests {
 
     #[test]
     fn it_works_2() {
-        //tracing_subscriber::fmt().with_max_level(Level::TRACE).init();
+        tracing_subscriber::fmt()
+            .with_max_level(Level::TRACE)
+            .init();
         let mut v = ArcLog::new();
 
         v.push(1);
@@ -43,7 +53,9 @@ mod tests {
 
     #[test]
     fn clone_len() {
-        //tracing_subscriber::fmt().with_max_level(Level::TRACE).init();
+        tracing_subscriber::fmt()
+            .with_max_level(Level::TRACE)
+            .init();
         let mut v = ArcLog::new();
         let mut v2 = v.clone();
 

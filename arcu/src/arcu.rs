@@ -28,9 +28,9 @@ impl<T> Future for Arcu<T> {
     type Output = ();
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let iself = self.inner();
-        if iself.count.load(Relaxed) == 1 && iself.forward.load(Relaxed) == ptr::null_mut() {
+        if iself.count.load(Relaxed) == 1 && iself.forward.load(Relaxed).is_null() {
             Poll::Ready(())
-        } else if iself.forward.load(Relaxed) == ptr::null_mut() {
+        } else if iself.forward.load(Relaxed).is_null() {
             let mut lock = iself.callbacks.lock().expect("lock shouldn't fail?");
             lock.push(cx.waker().clone());
             Poll::Pending
@@ -100,7 +100,6 @@ impl<T> Drop for Arcu<T> {
 unsafe fn drop_ref<T>(ptr: *mut ArcuInner<T>) {
     // release here because we want all of the changes before running the destructor
     if (*ptr).count.fetch_sub(1, Release) != 1 {
-        return;
     } else {
         //
         // this acquire is to prevent destructor code from creeping above
@@ -144,11 +143,7 @@ impl<T> Arcu<T> {
 
     pub fn has_update(&self) -> bool {
         let ptr = self.inner().forward.load(Relaxed);
-        if ptr.is_null() {
-            false
-        } else {
-            true
-        }
+        !ptr.is_null()
     }
 
     pub fn update(&mut self) -> bool {
