@@ -29,7 +29,7 @@ pub struct ArcLog<T, A: AllocRef + Freeze = Global> {
     pd: PhantomData<ArcLogInner<T, A>>,
 }
 
-impl<T: Freeze> ArcLog<T> {
+impl<T: Freeze + Sync> ArcLog<T> {
     pub fn new() -> Self {
         ArcLog::new_in(Global)
     }
@@ -139,7 +139,7 @@ impl<T, A: AllocRef + Freeze> ArcLog<T, A> {
     }
 }
 
-impl<T: Freeze, A: AllocRef + Freeze> ArcLog<T, A> {
+impl<T: Freeze + Sync, A: AllocRef + Freeze> ArcLog<T, A> {
     fn new_in(alloc: A) -> Self {
         ArcLog {
             ptr: ArcLogInner::new(alloc),
@@ -196,6 +196,8 @@ impl<T: Freeze, A: AllocRef + Freeze> ArcLog<T, A> {
 // capacity and len should not change once we have a non-null forward pointer
 struct ArcLogInnerHeader<T, A: AllocRef + Freeze> {
     count: AtomicUsize,
+    // AllocRef does not support grow in place (it currently does not)
+    // so this could just be a usize as it will not actually change
     cap: AtomicUsize,
     // len can never be greater than cap
     len: AtomicIsize,
