@@ -13,7 +13,7 @@ use core::slice;
 use core::sync::atomic::{AtomicIsize, AtomicPtr, AtomicUsize, Ordering::*};
 use std::alloc::Global;
 use std::collections::TryReserveError::{self, *};
-
+use core::fmt;
 use tracing::{event, instrument, Level};
 
 pub unsafe auto trait Freeze {}
@@ -42,6 +42,21 @@ impl<T, A: AllocRef + Freeze> Unpin for ArcLog<T, A> {}
 impl<T, A: AllocRef + Freeze> Drop for ArcLog<T, A> {
     fn drop(&mut self) {
         drop_ref(self.ptr);
+    }
+}
+
+impl<T: fmt::Debug, A: AllocRef + Freeze> fmt::Debug for ArcLog<T,A>{
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let inner = self.get_inner();
+        let mut len = inner.header.len.load(Acquire);
+        if len.is_negative() { len = !len; }
+        f.debug_struct("ArcLog")
+        .field("count", &inner.header.count.load(Relaxed))
+        .field("len", &len)
+        .field("forward", &inner.header.forward.load(Relaxed))
+       // .
+       // .field("data",  &inner.data as *const T, len as usize) })
+        .finish()
     }
 }
 
@@ -213,6 +228,7 @@ struct ArcLogInnerHeader<T, A: AllocRef + Freeze> {
     forward: AtomicPtr<ArcLogInner<T, A>>,
     alloc: ManuallyDrop<A>,
 }
+
 // This is a repr(C) because we need to makes sure that data is at the end.
 // The zero size array is used just to give a pointer to the len-sized data
 // that is allocated
@@ -450,7 +466,12 @@ impl<T, A: AllocRef + Freeze> ArcLogInner<T, A> {
                                 );
                             }
                             this.header.len.store(new_len, Release);
-                            return Ok(None);
+                            if this as *const Self == self as *const Self {
+                                return Ok(None);
+                            } else {
+                                return Ok(Some(this.into()));
+                            }
+                            
                         }
                         Err(_old_claim_val) => {}
                     }
@@ -573,6 +594,26 @@ mod tests {
         assert_eq!(v2.len(), 0);
         v2.update();
         assert_eq!(v2.len(), 2);
+    }
+
+    #[test]
+    fn shared_data() {
+        let _ = tracing_subscriber::fmt()
+            .with_max_level(Level::TRACE)
+            .with_test_writer()
+            .try_init();
+        let mut copy_1 = ArcLog::new();
+        event!(Level::TRACE, "Copy_1::new() : {:?}", copy_1);
+        let mut copy_2 = copy_1.clone();
+        event!(Level::TRACE, "Copy_2::clone() : {:?}", copy_2);
+        copy_1.push(1);
+        event!(Level::TRACE, "Copy_1::push() : {:?}", copy_1);
+        copy_2.push(2);
+        event!(Level::TRACE, "Copy_2::push() : {:?}", copy_2);
+        copy_1.update();
+        event!(Level::TRACE, "Copy_1::update() : {:?}", copy_1);
+        assert_eq!(copy_1[1], 2);
+        assert_eq!(copy_2[0], 1);
     }
 
     #[test]
