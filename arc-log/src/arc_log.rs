@@ -45,17 +45,18 @@ impl<T, A: AllocRef + Freeze> Drop for ArcLog<T, A> {
     }
 }
 
+
 impl<T: fmt::Debug, A: AllocRef + Freeze> fmt::Debug for ArcLog<T,A>{
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let inner = self.get_inner();
-        let mut len = inner.header.len.load(Acquire);
-        if len.is_negative() { len = !len; }
+        let len_raw = inner.header.len.load(Relaxed);
+        let len = if len_raw.is_negative() { !len_raw } else { len_raw };
         f.debug_struct("ArcLog")
         .field("count", &inner.header.count.load(Relaxed))
+        .field("len_raw", &len_raw)
         .field("len", &len)
         .field("forward", &inner.header.forward.load(Relaxed))
-       // .
-       // .field("data",  &inner.data as *const T, len as usize) })
+        .field("data",  &&**self)
         .finish()
     }
 }
@@ -614,7 +615,11 @@ mod tests {
         event!(Level::TRACE, "Copy_1::update() : {:?}", copy_1);
         assert_eq!(copy_1[1], 2);
         assert_eq!(copy_2[0], 1);
+        let data = [1,2];
+        assert_eq!(data, *copy_1);
+        assert_eq!(data, *copy_2);
     }
+    
 
     #[test]
     fn mt_test() {
