@@ -36,7 +36,7 @@ impl<T: Freeze + Sync> ArcLog<T> {
 }
 
 unsafe impl<T, A: AllocRef + Freeze> Send for ArcLog<T, A> {}
-unsafe impl<T, A: AllocRef + Freeze> Sync for ArcLog<T, A> {}
+//unsafe impl<T, A: AllocRef + Freeze> Sync for ArcLog<T, A> {}
 impl<T, A: AllocRef + Freeze> Unpin for ArcLog<T, A> {}
 
 impl<T, A: AllocRef + Freeze> Drop for ArcLog<T, A> {
@@ -512,6 +512,8 @@ mod tests {
     use std::thread;
     use tracing_subscriber;
 
+    const TEST_LEVEL: Level = Level::DEBUG;
+
     #[derive(Debug)]
     struct DropTest(usize);
 
@@ -525,7 +527,7 @@ mod tests {
     #[test]
     fn it_works() {
         let _ = tracing_subscriber::fmt()
-            .with_max_level(Level::TRACE)
+            .with_max_level(TEST_LEVEL)
             .with_test_writer()
             .try_init();
         let mut v = ArcLog::new();
@@ -570,7 +572,7 @@ mod tests {
     fn it_works_2() {
         //use std::sync::Arc;
         let _ = tracing_subscriber::fmt()
-            .with_max_level(Level::TRACE)
+            .with_max_level(TEST_LEVEL)
             .with_test_writer()
             .try_init();
         let mut v = ArcLog::new();
@@ -583,7 +585,7 @@ mod tests {
     #[test]
     fn clone_len() {
         let _ = tracing_subscriber::fmt()
-            .with_max_level(Level::TRACE)
+            .with_max_level(TEST_LEVEL)
             .with_test_writer()
             .try_init();
         let mut v = ArcLog::new();
@@ -599,7 +601,7 @@ mod tests {
     #[test]
     fn shared_data() {
         let _ = tracing_subscriber::fmt()
-            .with_max_level(Level::TRACE)
+            .with_max_level(TEST_LEVEL)
             .with_test_writer()
             .try_init();
         let mut copy_1 = ArcLog::new();
@@ -619,7 +621,7 @@ mod tests {
     #[test]
     fn mt_test() {
         let _ = tracing_subscriber::fmt()
-            .with_max_level(Level::DEBUG)
+            .with_max_level(TEST_LEVEL)
             .with_test_writer()
             .try_init();
         let mut v = ArcLog::new();
