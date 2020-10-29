@@ -38,20 +38,4 @@ fn main(){
 
 Sharing in a multiple threads
 
-```rust
-use arc_log::ArcLog;
-
-fn main(){
-    let mut copy_1 = ArcLog::new();
-    let mut copy_2 = copy_1.clone();
-
-    copy_1.push(1);
-    copy_2.push(2);
-    copy_1.update();
-    assert_eq!(copy_1[1], 2);
-    assert_eq!(copy_2[0], 1);
-    let data = [1,2];
-    assert_eq!(data, *copy_1);
-    assert_eq!(data, *copy_2);
-}
-```
+TODO!
