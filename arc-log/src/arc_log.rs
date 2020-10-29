@@ -231,8 +231,8 @@ struct ArcLogInnerHeader<T, A: AllocRef + Freeze> {
 }
 
 // This is a repr(C) because we need to makes sure that data is at the end.
-// The zero size array is used just to give a pointer to the len-sized data
-// that is allocated
+// The zero size array is used just to give a starting point to the len-sized data
+// that is appended to as part of the allocation
 #[repr(C)]
 struct ArcLogInner<T, A: AllocRef + Freeze> {
     header: ArcLogInnerHeader<T, A>,
