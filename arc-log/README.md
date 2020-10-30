@@ -57,4 +57,3 @@ fn main(){
     assert_eq!(copy_1[i2], 2);
 }
 ```
-
