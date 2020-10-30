@@ -1,5 +1,5 @@
-use core::alloc::AllocRef;
-use core::alloc::Layout;
+use alloc::alloc::{handle_alloc_error, AllocRef, Layout, Global};
+
 use core::ops::Index;
 use core::slice::SliceIndex;
 
@@ -11,8 +11,6 @@ use core::ops::Deref;
 use core::ptr::{self, NonNull};
 use core::slice;
 use core::sync::atomic::{AtomicIsize, AtomicPtr, AtomicUsize, Ordering::*};
-use std::alloc::Global;
-use std::collections::TryReserveError::{self, *};
 use core::fmt;
 use tracing::{event, instrument, Level};
 
@@ -33,9 +31,14 @@ impl<T: Freeze + Sync> ArcLog<T> {
     pub fn new() -> Self {
         ArcLog::new_in(Global)
     }
+    pub fn with_capacity(capacity: usize) -> Self {
+        ArcLog::with_capacity_in(capacity, Global)
+    }
 }
 
 unsafe impl<T, A: AllocRef + Freeze> Send for ArcLog<T, A> {}
+// nothing prevents ArcLog from being Sync, but we may way to reserve
+// this for future optimization, like keeping a local len value
 //unsafe impl<T, A: AllocRef + Freeze> Sync for ArcLog<T, A> {}
 impl<T, A: AllocRef + Freeze> Unpin for ArcLog<T, A> {}
 
@@ -45,7 +48,8 @@ impl<T, A: AllocRef + Freeze> Drop for ArcLog<T, A> {
     }
 }
 
-
+// there is likely a decision to make as to whether we should include Ts
+// and have bound, or ignore them so you can always debug
 impl<T: fmt::Debug, A: AllocRef + Freeze> fmt::Debug for ArcLog<T,A>{
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let inner = self.get_inner();
@@ -156,9 +160,16 @@ impl<T, A: AllocRef + Freeze> ArcLog<T, A> {
 }
 
 impl<T: Freeze + Sync, A: AllocRef + Freeze> ArcLog<T, A> {
-    fn new_in(alloc: A) -> Self {
+    pub fn new_in(alloc: A) -> Self {
         ArcLog {
-            ptr: ArcLogInner::new(alloc),
+            ptr: ArcLogInner::with_capacity(0, alloc),
+            pd: PhantomData,
+        }
+    }
+
+    pub fn with_capacity_in(capacity: usize, alloc: A) -> Self {
+        ArcLog {
+            ptr: ArcLogInner::with_capacity(capacity, alloc),
             pd: PhantomData,
         }
     }
@@ -193,10 +204,8 @@ impl<T: Freeze + Sync, A: AllocRef + Freeze> ArcLog<T, A> {
         }
     }
 
-    #[instrument(skip(self, item))]
-    pub fn push(&mut self, item: T) {
-        event!(Level::TRACE, "pre alloc_one");
-        if let Some(new_ptr) = self.get_inner().alloc_one(item) {
+    fn finish_push(&mut self, index: isize, o_ptr: Option<NonNull<ArcLogInner<T, A>>>, item: T) -> Result<usize, T> {
+        if let Some(new_ptr) = o_ptr {
             event!(Level::TRACE, "post alloc_one");
             let old_ptr = self.ptr;
             unsafe { new_ptr.as_ref().header.count.fetch_add(1, Relaxed) };
@@ -206,7 +215,37 @@ impl<T: Freeze + Sync, A: AllocRef + Freeze> ArcLog<T, A> {
             event!(Level::TRACE, "post drop ref")
         }
         event!(Level::TRACE, "finished push");
+        if index == -1 { Err(item) } else {
+            let _ = ManuallyDrop::new(item);
+            Ok(index as usize)
+        }        
     }
+
+    #[instrument(skip(self, item))]
+    pub fn push_spin(&mut self, item: T) -> usize {
+        let (index, o_ptr ) = self.get_inner().alloc_items(&item, 1, isize::MAX);
+        match self.finish_push(index, o_ptr, item){
+            Ok(i) => { i }
+            Err(_) => unreachable!()
+        }
+    }
+
+    #[instrument(skip(self, item))]
+    pub fn push_or_return(&mut self, item: T) -> Result<usize, T> {
+        let (index, o_ptr ) = self.get_inner().alloc_items_one_shot(&item, 1, isize::MAX);
+        self.finish_push(index, o_ptr, item)
+    }
+    #[instrument(skip(self, item))]
+    pub fn push_spin_by_index(&mut self, item: T, index: usize) -> Result<usize, T> {
+        let (index, o_ptr ) = self.get_inner().alloc_items(&item, 1, index as isize);
+        self.finish_push(index, o_ptr, item)
+            
+    }
+    pub fn push_or_return_by_index(&mut self, item: T, index: usize) -> Result<usize, T> {
+        let (index, o_ptr ) = self.get_inner().alloc_items_one_shot(&item, 1, index as isize);
+        self.finish_push(index, o_ptr, item)        
+    }
+
 }
 
 // capacity and len should not change once we have a non-null forward pointer
@@ -240,9 +279,10 @@ struct ArcLogInner<T, A: AllocRef + Freeze> {
 }
 
 impl<T, A: AllocRef + Freeze> ArcLogInner<T, A> {
-    fn new(alloc: A) -> NonNull<Self> {
+    
+    fn with_capacity(capacity: usize, alloc: A) -> NonNull<Self> {
         let new_alloc = alloc
-            .alloc(Self::get_layout(0))
+            .alloc(Self::get_layout(capacity))
             .expect("Error allocating")
             .as_mut_ptr();
         // SAFETY: The alloc was just made with T layout so this cast is safe
@@ -253,7 +293,7 @@ impl<T, A: AllocRef + Freeze> ArcLogInner<T, A> {
             if mem::size_of::<T>() == 0 {
                 isize::MAX as usize
             } else {
-                0
+                capacity
             },
             Relaxed,
         );
@@ -279,19 +319,193 @@ impl<T, A: AllocRef + Freeze> ArcLogInner<T, A> {
         this
     }
 
-    #[instrument(skip(self, item))]
-    fn alloc_one(&self, item: T) -> Option<NonNull<Self>> {
-        let i = self.alloc_items(&item, 1).unwrap();
-        let _ = ManuallyDrop::new(item);
-        i
+    #[instrument(skip(self))]
+    fn alloc_items_one_shot(
+        &self,
+        data_ptr: *const T,
+        count: usize,
+        ref_index: isize,
+    ) -> (isize, Option<NonNull<Self>>) {
+        event!(Level::TRACE, "enter alloc items one shot");
+        debug_assert!(count > 0);
+        let size_of_t = mem::size_of::<T>();
+        if size_of_t == 0 {
+            event!(Level::TRACE, "is zero sized");
+            let len = self.header.len.load(Acquire);
+            if len.is_negative() || len > ref_index as isize { return (-1, None); }
+            else {
+                // TODO: Find out what nightly Vec with alloc does here
+                let not_len = !len;
+                let new_len = len.checked_add(count as isize).expect("Too many entries");
+                match self
+                    .header
+                    .len
+                    .compare_exchange(len, not_len, Relaxed, Relaxed)
+                {
+                    Ok(_old_claim_val) => {
+                        self.header.len.store(new_len, Release);
+                        return (len, None);
+                    }
+                    Err(_old_claim_val) => { return (-1, None); }
+                }
+            }
+        } else {
+            let mut this = self;
+            event!(Level::TRACE, "is not zero sized");
+            this = Self::get_next_address(this);
+            event!(Level::TRACE, "got new address");
+            // we reached the end of the forwarding so we have have to set an acquire barrier so that
+            // everything is in sync
+            let len = this.header.len.load(Acquire);
+            if len.is_negative() || len > ref_index {
+                return if this as *const _ == self as *const _ { (-1, None) } else { (-1, Some(this.into())) };    
+            }
+            let negative_len = !len;
+            // this should still respect boundary set by len
+            let new_len = len.checked_add(count as isize).expect("Too many entries");
+            let cap = this.header.cap.load(Relaxed);
+            if new_len as usize > cap {
+                event!(Level::TRACE, "had to reallocate");
+                // This guarantees exponential growth. The doubling cannot overflow
+                // because `cap <= isize::MAX` and the type of `cap` is `usize`.
+                let n_cap = cmp::max(cap * 2, new_len as usize);
+
+                let elem_size = size_of_t;
+                let min_non_zero_cap = if elem_size == 1 {
+                    8
+                } else if elem_size <= 1024 {
+                    4
+                } else {
+                    1
+                };
+                let n_cap = cmp::max(min_non_zero_cap, n_cap);
+                event!(Level::TRACE, "new allocation has this size {:?}", n_cap);
+                let req_layout = Self::get_layout(n_cap);
+                event!(Level::TRACE, "got new layout");
+                let req_size = req_layout.size();
+                match this
+                        .header
+                        .len
+                        .compare_exchange(len, negative_len, Relaxed, Relaxed)
+                    {
+                        Ok(_old_claim_val) => {
+                            event!(Level::TRACE, "got claim to add entries");
+
+                            // while we waited for the lock someone may have added a forwarding address which would means
+                            // we might be trying to write to the wrong place
+                            let new_forward = this.header.forward.load(Relaxed);
+                            if !new_forward.is_null() {
+                                event!(
+                                    Level::TRACE,
+                                    "forward was updated while grabbing claim, fail"
+                                );
+                                // we aren't at the most up to date location, so reset the lock and restart from
+                                // a more up to date location
+                                this.header.len.store(len, Relaxed);
+                                return (-1, Some(unsafe {NonNull::new_unchecked(this as *const _ as *mut _)}));
+                            }
+                            let ptr =  self.header.alloc.alloc(req_layout).unwrap_or_else(|_| handle_alloc_error(req_layout));
+                            event!(Level::TRACE, "got allocation");
+                            let new_mut_ref = unsafe {
+                                let new_alloc_len = ptr.as_ref().len();
+                                event!(
+                                            Level::TRACE,
+                                            "Old ptr: {:?} new_ptr: {:?} with len: {:?}",
+                                            this as *const _,
+                                            ptr,
+                                            new_alloc_len
+                                        );
+                                assert_eq!(new_alloc_len, req_size);
+
+                                let new_mut_ptr = ptr.as_mut_ptr() as *mut Self;
+
+                                ptr::copy_nonoverlapping(this, new_mut_ptr, 1);
+                                ptr::copy_nonoverlapping(
+                                            this.data.as_ptr(),
+                                            (*new_mut_ptr).data.as_mut_ptr(),
+                                            len as usize,
+                                        );
+                                event!(
+                                            Level::TRACE,
+                                            "start writing new data to new allocation"
+                                        );
+                                ptr::copy_nonoverlapping(
+                                            data_ptr,
+                                            (*new_mut_ptr).data.as_mut_ptr().offset(len),
+                                            count,
+                                        );
+                                &mut *new_mut_ptr
+                            };
+                            event!(Level::TRACE, "updating automics");
+                            new_mut_ref.header.count.store(1, Relaxed);
+                            new_mut_ref.header.cap.store(n_cap, Relaxed);
+                            new_mut_ref.header.len.store(new_len, Relaxed);
+
+                            // the data has to be ready once we update the forward ptr,
+                            // so this must be a release
+                            this.header.forward.store(new_mut_ref, Release);
+                            // this should also be release, otherwise it could be moved before the forward
+                            // and the forward must be seen by the next write
+                            this.header.len.store(len, Release);
+                            return (len, Some(new_mut_ref.into()));    
+                        },
+                        Err(_old_claim_val) => {
+                            event!(Level::TRACE, "couldn't get claim");
+                            return if this as *const _ == self as *const _ { (-1, None) } else { (-1, Some(this.into())) };
+                        }
+                    }
+                } else {
+                    match this
+                        .header
+                        .len
+                        .compare_exchange(len, negative_len, Relaxed, Relaxed)
+                    {
+                        Ok(_old_claim_val) => {
+                            // while we waited for the lock someone may have added a forwarding address which would means
+                            // we might be trying to write to the wrong place
+                            let new_forward = this.header.forward.load(Relaxed);
+                            if !new_forward.is_null() {
+                                // we aren't at the most up to date location, so reset the lock and restart from
+                                // a more up to date location
+                                this.header.len.store(len, Relaxed);
+
+                                this.header.len.store(len, Relaxed);
+                                return (-1, Some(unsafe {NonNull::new_unchecked(this as *const _ as *mut _)}));
+                            }
+                            // we can just add our data an and update the len
+                            unsafe {
+                                ptr::copy_nonoverlapping(
+                                    data_ptr,
+                                    (this.data.as_ptr() as *mut T).offset(len as isize),
+                                    count,
+                                );
+                            }
+                            this.header.len.store(new_len, Release);
+                            if this as *const Self == self as *const Self {
+                                return (len, None);
+                            } else {
+                                return (len, Some(this.into()));
+                            }
+                            
+                        }
+                        Err(_old_claim_val) => {
+                            return if this as *const _ == self as *const _ { (-1, None) } else { (-1, Some(this.into())) };
+                        }
+                    
+                } 
+            }
+        }
+
     }
+
 
     #[instrument(skip(self))]
     fn alloc_items(
         &self,
         data_ptr: *const T,
         count: usize,
-    ) -> Result<Option<NonNull<Self>>, TryReserveError> {
+        ref_index: isize,
+    ) -> (isize, Option<NonNull<Self>>) {
         event!(Level::TRACE, "enter alloc items");
         debug_assert!(count > 0);
         let size_of_t = mem::size_of::<T>();
@@ -304,9 +518,13 @@ impl<T, A: AllocRef + Freeze> ArcLogInner<T, A> {
                     // maybe we should sleep?
                     len = self.header.len.load(Acquire);
                 }
+                
+                if len > ref_index {
+                    return (-1, None);
+                } 
                 // this should still respect boundary set by len
                 let negative_len = !len;
-                let new_len = len.checked_add(count as isize).ok_or(CapacityOverflow)?;
+                let new_len = len.checked_add(count as isize).expect("Too many entries");
                 match self
                     .header
                     .len
@@ -314,7 +532,7 @@ impl<T, A: AllocRef + Freeze> ArcLogInner<T, A> {
                 {
                     Ok(_old_claim_val) => {
                         self.header.len.store(new_len, Release);
-                        return Ok(None);
+                        return (len, None);
                     }
                     Err(_old_claim_val) => {}
                 }
@@ -333,11 +551,13 @@ impl<T, A: AllocRef + Freeze> ArcLogInner<T, A> {
                     // maybe we should sleep?
                     len = this.header.len.load(Acquire);
                 }
-
+                if len > ref_index {
+                    return if this as *const _ == self as *const _ { (-1, None) } else { (-1, Some(this.into())) };
+                }
                 let negative_len = !len;
 
                 // this should still respect boundary set by len
-                let new_len = len.checked_add(count as isize).ok_or(CapacityOverflow)?;
+                let new_len = len.checked_add(count as isize).expect("Too many entries");
 
                 let cap = this.header.cap.load(Relaxed);
 
@@ -387,10 +607,9 @@ impl<T, A: AllocRef + Freeze> ArcLogInner<T, A> {
                                 );
                                 continue;
                             }
-                            match self.header.alloc.alloc(req_layout) {
-                                Ok(ptr) => {
-                                    event!(Level::TRACE, "got allocation");
-                                    let new_mut_ref = unsafe {
+                            let ptr =  self.header.alloc.alloc(req_layout).unwrap_or_else(|_| handle_alloc_error(req_layout));
+                            event!(Level::TRACE, "got allocation");
+                            let new_mut_ref = unsafe {
                                         let new_alloc_len = ptr.as_ref().len();
                                         event!(
                                             Level::TRACE,
@@ -430,12 +649,10 @@ impl<T, A: AllocRef + Freeze> ArcLogInner<T, A> {
                                     this.header.forward.store(new_mut_ref, Release);
                                     // this should also be release, otherwise it could be moved before the forward
                                     // and the forward must be seen by the next write
-                                    this.header.len.store(len, Release);
-                                    return Ok(Some(new_mut_ref.into()));
-                                }
-                                Err(_e) => panic!("Couldn't allocate!"),
-                            }
-                        }
+                            this.header.len.store(len, Release);
+                            return (len, Some(new_mut_ref.into()));
+                                
+                        },
                         Err(_old_claim_val) => {
                             event!(Level::TRACE, "couldn't get claim");
                         }
@@ -468,9 +685,9 @@ impl<T, A: AllocRef + Freeze> ArcLogInner<T, A> {
                             }
                             this.header.len.store(new_len, Release);
                             if this as *const Self == self as *const Self {
-                                return Ok(None);
+                                return (len, None);
                             } else {
-                                return Ok(Some(this.into()));
+                                return (len, Some(this.into()));
                             }
                             
                         }
@@ -507,172 +724,4 @@ impl<T, A: AllocRef + Freeze> ArcLogInner<T, A> {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::thread;
-    use tracing_subscriber;
 
-    const TEST_LEVEL: Level = Level::DEBUG;
-
-    #[derive(Debug)]
-    struct DropTest(usize);
-
-    impl Drop for DropTest {
-        #[instrument]
-        fn drop(&mut self) {
-            event!(Level::TRACE, "Dropping test, value: {:?}", self.0);
-        }
-    }
-
-    #[test]
-    fn it_works() {
-        let _ = tracing_subscriber::fmt()
-            .with_max_level(TEST_LEVEL)
-            .with_test_writer()
-            .try_init();
-        let mut v = ArcLog::new();
-
-        v.push(DropTest(1));
-        for i in 0..1 {
-            event!(Level::TRACE, " {:?}", v[i]);
-        }
-        event!(Level::TRACE, " end data");
-        v.push(DropTest(2));
-        for i in 0..2 {
-            event!(Level::TRACE, " {:?}", v[i]);
-        }
-        event!(Level::TRACE, " end data");
-        v.push(DropTest(3));
-
-        for i in 0..3 {
-            event!(Level::TRACE, " {:?}", v[i]);
-        }
-        event!(Level::TRACE, " end data");
-        v.push(DropTest(4));
-        for i in 0..4 {
-            event!(Level::TRACE, " {:?}", v[i]);
-        }
-        event!(Level::TRACE, " end data");
-        v.push(DropTest(5));
-        for i in 0..5 {
-            event!(Level::TRACE, " {:?}", v[i]);
-        }
-        event!(Level::TRACE, " end data");
-        v.push(DropTest(6));
-        for i in 0..6 {
-            event!(Level::TRACE, " {:?}", v[i]);
-        }
-        event!(Level::TRACE, " end data");
-
-        let av: &[_] = &*v;
-        assert_eq!(av[1].0, 2);
-    }
-
-    #[test]
-    fn it_works_2() {
-        //use std::sync::Arc;
-        let _ = tracing_subscriber::fmt()
-            .with_max_level(TEST_LEVEL)
-            .with_test_writer()
-            .try_init();
-        let mut v = ArcLog::new();
-
-        v.push(Box::new(AtomicUsize::new(1)));
-        //v.push(2);
-        //assert_eq!(v[1], 2);
-    }
-
-    #[test]
-    fn clone_len() {
-        let _ = tracing_subscriber::fmt()
-            .with_max_level(TEST_LEVEL)
-            .with_test_writer()
-            .try_init();
-        let mut v = ArcLog::new();
-        let mut v2 = v.clone();
-
-        v.push(DropTest(1));
-        v.push(DropTest(2));
-        assert_eq!(v2.len(), 0);
-        v2.update();
-        assert_eq!(v2.len(), 2);
-    }
-
-    #[test]
-    fn shared_data() {
-        let _ = tracing_subscriber::fmt()
-            .with_max_level(TEST_LEVEL)
-            .with_test_writer()
-            .try_init();
-        let mut copy_1 = ArcLog::new();
-        event!(Level::TRACE, "Copy_1::new() : {:?}", copy_1);
-        let mut copy_2 = copy_1.clone();
-        event!(Level::TRACE, "Copy_2::clone() : {:?}", copy_2);
-        copy_1.push(1);
-        event!(Level::TRACE, "Copy_1::push() : {:?}", copy_1);
-        copy_2.push(2);
-        event!(Level::TRACE, "Copy_2::push() : {:?}", copy_2);
-        copy_1.update();
-        event!(Level::TRACE, "Copy_1::update() : {:?}", copy_1);
-        assert_eq!(copy_1[1], 2);
-        assert_eq!(copy_2[0], 1);
-        let data = [1,2];
-        assert_eq!(data, *copy_1);
-        assert_eq!(data, *copy_2);
-    }
-    
-
-    #[test]
-    fn mt_test() {
-        let _ = tracing_subscriber::fmt()
-            .with_max_level(TEST_LEVEL)
-            .with_test_writer()
-            .try_init();
-        let mut v = ArcLog::new();
-        let v2 = v.clone();
-        let handle1 = thread::spawn(move || {
-            let mut v2 = v2;
-            for _i in 0..100 {
-                v2.push(1);
-            }
-        });
-        let v2 = v.clone();
-        let handle2 = thread::spawn(move || {
-            let mut v2 = v2;
-            for _i in 0..100 {
-                v2.push(2);
-            }
-        });
-        let v2 = v.clone();
-        let handle3 = thread::spawn(move || {
-            let mut v2 = v2;
-            for _i in 0..100 {
-                v2.push(3);
-            }
-        });
-        let v2 = v.clone();
-        let handle4 = thread::spawn(move || {
-            let mut v2 = v2;
-            for _i in 0..100 {
-                v2.push(4);
-            }
-        });
-        for _i in 0..50 {
-            v.push(0);
-        }
-        handle1.join().unwrap();
-        handle2.join().unwrap();
-        handle3.join().unwrap();
-        handle4.join().unwrap();
-        v.update();
-        let v_ref: &[i32] = &v;
-        event!(Level::INFO, "values: {:?}", v_ref);
-        assert_eq!(v.len(), 450);
-        assert_eq!(v.iter().filter(|t| **t == 0).count(), 50);
-        assert_eq!(v.iter().filter(|t| **t == 1).count(), 100);
-        assert_eq!(v.iter().filter(|t| **t == 2).count(), 100);
-        assert_eq!(v.iter().filter(|t| **t == 3).count(), 100);
-        assert_eq!(v.iter().filter(|t| **t == 4).count(), 100);
-    }
-}

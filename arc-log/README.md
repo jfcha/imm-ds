@@ -28,6 +28,7 @@ fn main(){
     copy_1.push(1);
     copy_2.push(2);
     copy_1.update();
+
     assert_eq!(copy_1[1], 2);
     assert_eq!(copy_2[0], 1);
     let data = [1,2];
@@ -44,14 +45,16 @@ use arc_log::ArcLog;
 fn main(){
     let mut copy_1 = ArcLog::new();
     let mut copy_2 = copy_1.clone();
-
-    copy_1.push(1);
-    copy_2.push(2);
+    let handle = thread::spawn(move || {
+        copy_2.push_spin(2)
+    });
+    let i1 = copy_1.push_spin(1);
+    let i2 = handle.join().unwrap();
     copy_1.update();
-    assert_eq!(copy_1[1], 2);
-    assert_eq!(copy_2[0], 1);
-    let data = [1,2];
-    assert_eq!(data, *copy_1);
-    assert_eq!(data, *copy_2);
+    
+    assert_eq!(copy_1.len(), 2);
+    assert_eq!(copy_1[i1], 1);
+    assert_eq!(copy_1[i2], 2);
 }
 ```
+
