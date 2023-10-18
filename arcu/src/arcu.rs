@@ -1,4 +1,4 @@
-use core::borrow;
+use core::{borrow, fmt};
 use core::future::Future;
 use core::isize;
 use core::fmt;
@@ -243,5 +243,18 @@ impl<T> Arcu<T> {
                 }
             }
         }
+    }
+}
+// there is a decision to make as to whether we should include Ts
+// and have bound, or ignore them so you can always debug
+impl<T: fmt::Debug> fmt::Debug for Arcu<T> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let inner = self.inner();
+        f.debug_struct("Arcu")
+            .field("ptr", &self.ptr)
+            .field("forward", &inner.forward.load(Relaxed))
+            .field("count", &inner.count.load(Relaxed))
+            .field("data", &inner.data)
+            .finish()
     }
 }

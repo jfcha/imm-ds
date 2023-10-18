@@ -1,7 +1,6 @@
 #![feature(
     allocator_api,
     slice_ptr_get,
-    try_reserve,
     auto_traits,
     negative_impls,
     ptr_metadata,
@@ -15,6 +14,6 @@ extern crate alloc;
 pub mod arc_log;
 //pub mod log_fragment;
 pub use crate::arc_log::*;
-pub mod waker_list;
-pub use waker_list::*;
+//pub mod waker_list;
+//pub use waker_list::*;
 
