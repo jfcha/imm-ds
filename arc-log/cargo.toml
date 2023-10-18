@@ -2,7 +2,7 @@
 name = "arc-log"
 version = "0.0.1"
 authors = ["Joshua Chartier <jfchartier@gmail.com>"]
-edition = "2018"
+edition = "2021"
 license = "MIT OR Apache-2.0"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
@@ -11,4 +11,4 @@ license = "MIT OR Apache-2.0"
 tracing = "0.1"
 
 [dev-dependencies]
-tracing-subscriber = "0.2"
+tracing-subscriber = "0.3"

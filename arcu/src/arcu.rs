@@ -1,6 +1,7 @@
 use core::borrow;
 use core::future::Future;
 use core::isize;
+use core::fmt;
 use core::marker::{PhantomData, Unpin};
 use core::ops::{Deref, Drop};
 use core::pin::Pin;
@@ -10,13 +11,17 @@ use core::task::{Context, Poll, Waker};
 use std::process;
 use std::sync::Mutex;
 
+//use tracing::{event, instrument, Level};
+
 const MAX_REFCOUNT: usize = (isize::MAX) as usize;
 
 struct ArcuInner<T> {
     count: AtomicUsize,
     forward: AtomicPtr<ArcuInner<T>>,
     data: T,
-    callbacks: Mutex<Vec<Waker>>,
+    // you only need to keep track of latest waker
+    callback: NonNull<Mutex<Option<Waker>>>,
+    cb_phantom: PhantomData<Mutex<Option<Waker>>>
 }
 
 pub struct Arcu<T> {
@@ -25,17 +30,15 @@ pub struct Arcu<T> {
 }
 
 impl<T> Future for Arcu<T> {
-    type Output = ();
-    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        let iself = self.inner();
-        if iself.count.load(Relaxed) == 1 && iself.forward.load(Relaxed).is_null() {
-            Poll::Ready(())
-        } else if iself.forward.load(Relaxed).is_null() {
-            let mut lock = iself.callbacks.lock().expect("lock shouldn't fail?");
-            lock.push(cx.waker().clone());
-            Poll::Pending
+    type Output = Self;
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let updated = self.update();
+        if updated {
+            Poll::Ready(self.clone())
         } else {
-            Poll::Ready(())
+            let mut lock = unsafe { self.inner().callback.as_ref().lock().expect("lock shouldn't fail")};
+            *lock = Some(cx.waker().clone());
+            Poll::Pending
         }
     }
 }
@@ -78,15 +81,15 @@ impl<T> AsRef<T> for Arcu<T> {
     }
 }
 
-impl<T> Drop for ArcuInner<T> {
-    fn drop(&mut self) {
-        // I think this can be relaxed because all callers would have acquired right before this
-        let ptr = self.forward.load(Relaxed);
-        if !ptr.is_null() {
-            // drop ref creates a memory barrier
-            unsafe { drop_ref(ptr) };
-        }
-    }
+impl<T: fmt::Debug> fmt::Debug for Arcu<T> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let inner = self.inner();
+        f.debug_struct("Arcu")
+            .field("forward", &inner.forward.load(Relaxed))
+            .field("count", &inner.count.load(Relaxed))
+            .field("data", &&**self)
+            .finish()
+    }    
 }
 
 impl<T> Drop for Arcu<T> {
@@ -95,6 +98,21 @@ impl<T> Drop for Arcu<T> {
         unsafe { drop_ref(ptr) };
     }
 }
+
+impl<T> Drop for ArcuInner<T> {
+    fn drop(&mut self) {
+        // I think this can be relaxed because all callers would have acquired right before this
+        let ptr = self.forward.load(Relaxed);
+        if !ptr.is_null() {
+            // drop ref creates a memory barrier
+            unsafe { drop_ref(ptr) };
+        } else {
+            unsafe { ptr::drop_in_place(self.callback.as_ptr()) };
+        }
+    }
+}
+
+
 
 #[inline]
 unsafe fn drop_ref<T>(ptr: *mut ArcuInner<T>) {
@@ -120,11 +138,13 @@ impl<T> Arcu<T> {
 
     #[inline]
     pub fn new(data: T) -> Arcu<T> {
+        let cb = Box::new(Mutex::new(None));
         let x: Box<_> = Box::new(ArcuInner {
             count: AtomicUsize::new(1),
             forward: AtomicPtr::default(),
             data,
-            callbacks: Mutex::new(Vec::new()),
+            callback: Box::leak(cb).into(),
+            cb_phantom: PhantomData::default()
         });
         Arcu {
             ptr: Box::leak(x).into(),
@@ -190,14 +210,17 @@ impl<T> Arcu<T> {
 
     #[inline]
     pub fn update_value(&mut self, data: T) {
+        let inner = self.inner();
         let x: Box<_> = Box::new(ArcuInner {
             count: AtomicUsize::new(1),
             forward: AtomicPtr::default(),
             data,
-            callbacks: Mutex::new(Vec::new()),
+            callback: inner.callback,
+            cb_phantom: PhantomData::default()
         });
         let new_ptr = Box::leak(x);
-        let mut cur_point = self.ptr.as_ptr();
+        //let orig_ptr 
+        let mut cur_point = inner as *const _ as *mut ArcuInner<T>;
         // we just update the forward pointer, updating self to point to the new reference will be done on deref
         loop {
             match unsafe {
@@ -209,8 +232,8 @@ impl<T> Arcu<T> {
                 )
             } {
                 Ok(_) => {
-                    let mut cbs = unsafe { (*cur_point).callbacks.lock().unwrap() };
-                    while let Some(c) = cbs.pop() {
+                    let mut cbs = unsafe { inner.callback.as_ref().lock().unwrap() };
+                    if let Some(c) = cbs.take() {
                         c.wake();
                     }
                     return;
